@@ -1,131 +1,198 @@
 #include <DHT.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>
 
-//-------------------------Configuración------------------//
-const char* ssid = "MSOSARES.R";
-const char* password = "M433#sosa";
-//--------------------------------------------------------//
-const char* apiKey = "12I8DTICBK8BYVV5";
-const char* server = "https://api.thingspeak.com/update";
-//--------------------------------------------------------//
+//---------------- WIFI ----------------//
+const char* ssid = "CANO SOSA";
+const char* password = "39215260";
 
+//---------------- MQTT ----------------//
+const char* mqtt_server = "192.168.1.16"; 
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+//---------------- SENSORES ----------------//
 #define DHTPIN 4
 #define DHTTYPE DHT22
-
 const int ldrPin = 34;
 
 DHT dht(DHTPIN, DHTTYPE);
 
-int minLuz = 4095;  // Valor mínimo (más oscuro)
-int maxLuz = 0;     // Valor máximo (más brillante)
+//---------------- VARIABLES ----------------//
+int minLuz = 4095;
+int maxLuz = 0;
 
-void setup() {
-  Serial.begin(115200);
+float temperatura = 0;
+float humedad = 0;
+int porcentajeLuz = 0;
 
-  analogReadResolution(12);
-  dht.begin();
+//---------------- TIMERS ----------------//
+unsigned long tSensores = 0;
+unsigned long tEnvio = 0;
+unsigned long tLED = 0;
 
-  //------------------------WiFI----------------------------//
-  WiFi.mode(WIFI_STA);
+//---------------- ESTADOS ----------------//
+enum Estado {
+  NORMAL,
+  ALERTA_TEMP,
+  ALERTA_LUZ,
+  ALERTA_DOBLE
+};
+
+Estado estadoActual = NORMAL;
+
+//---------------- HISTÉRESIS ----------------//
+float tempAlta = 30;
+float tempBaja = 28;
+
+//---------------- WIFI ----------------//
+void setup_wifi() {
   WiFi.begin(ssid, password);
-  Serial.print("Conectando al WiFi");
-  
-  int intentos = 0;
+  Serial.print("Conectando WiFi");
 
-  while (WiFi.status() != WL_CONNECTED && intentos < 20) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    intentos++;
   }
 
-  if (WiFi.status() == WL_CONNECTED){
-    Serial.print("Red Wifi: ");
-    Serial.println(WiFi.SSID());
-    Serial.print("Ip asignada: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.print("\n No hubo conexión");
-  }
-
-  // ---------------- CALIBRACIÓN LDR ---------------------//
-  Serial.println("Calibrando sensor de luz...");
-  Serial.println("Expón el sensor a diferentes condiciones de luz");
-  
-  unsigned long startTime = millis();
-  while (millis() - startTime < 5000) {
-    int valor = analogRead(ldrPin);
-
-    
-    if (valor > minLuz) minLuz = valor;
-    if (valor < maxLuz) maxLuz = valor;
-
-    delay(10);
-  }
-  
-  Serial.println("Calibración completada!");
-  Serial.print("Rango LDR - Mínimo: ");
-  Serial.print(minLuz);
-  Serial.print(" | Máximo: ");
-  Serial.println(maxLuz);
-  Serial.println("----------------------------------------");
+  Serial.println("\nWiFi conectado");
+  Serial.println(WiFi.localIP());
 }
 
-//------------------------------------------------------------//
+//---------------- MQTT ----------------//
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Conectando a MQTT...");
 
-void loop() {
+    if (client.connect("ESP32Client")) {
+      Serial.println("Conectado ✔");
+    } else {
+      Serial.print("Error, rc=");
+      Serial.print(client.state());
+      Serial.println(" reintentando...");
+      delay(2000);
+    }
+  }
+}
+
+//---------------- SETUP ----------------//
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  analogReadResolution(12);
+
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+
+  // -------- CALIBRACIÓN --------
+  Serial.println("Calibrando LDR...");
+  unsigned long start = millis();
+
+  while (millis() - start < 5000) {
+    int valor = analogRead(ldrPin);
+
+    if (valor > minLuz) minLuz = valor; 
+    if (valor < maxLuz) maxLuz = valor;
+  }
+
+  Serial.println("Calibración lista");
+}
+
+//---------------- LECTURA SENSORES ----------------//
+void leerSensores() {
   int valorLdr = analogRead(ldrPin);
-  
-  
-  int porcentajeLuz = map(valorLdr, minLuz, maxLuz, 0, 100);
+
+  porcentajeLuz = map(valorLdr, minLuz, maxLuz, 0, 100);
   porcentajeLuz = constrain(porcentajeLuz, 0, 100);
-  
-  float temperatura = dht.readTemperature();
-  float humedad = dht.readHumidity();
-  
+
+  temperatura = dht.readTemperature();
+  humedad = dht.readHumidity();
+
   if (isnan(temperatura) || isnan(humedad)) {
-    Serial.println("Error leyendo DHT22");
-    delay(1000);
+    Serial.println("Error DHT");
     return;
   }
-  
-  Serial.print("Luz: ");
-  Serial.print(porcentajeLuz);
-  Serial.print("% | Temp: ");
-  Serial.print(temperatura, 2);
-  Serial.print(" C | Humedad: ");
-  Serial.println(humedad, 2);
 
-  // ---------------- ENVÍO A THINGSPEAK ----------------//
+  Serial.print("Temp: "); Serial.print(temperatura);
+  Serial.print(" | Hum: "); Serial.print(humedad);
+  Serial.print(" | Luz: "); Serial.println(porcentajeLuz);
+}
 
-  // No se necesito incluir la libreria de Thingspeak, 
-  //por que ya estamos haciendo una petición al servidor(HTTP GET)
-  
-  if (WiFi.status() == WL_CONNECTED){
-    HTTPClient http;
+//---------------- MAQUINA DE ESTADOS ----------------//
+void actualizarEstado() {
 
-    String url = String(server) + "?api_key=" + apiKey;
-    url += "&field1=" + String(temperatura);
-    url += "&field2=" + String(humedad);
-    url += "&field3=" + String(porcentajeLuz);
+  switch (estadoActual) {
 
-    Serial.println("Enviando info a ThingSpeak.....");
-    http.begin(url);
+    case NORMAL:
+      if (temperatura >= tempAlta && porcentajeLuz <= 20)
+        estadoActual = ALERTA_DOBLE;
+      else if (temperatura >= tempAlta)
+        estadoActual = ALERTA_TEMP;
+      else if (porcentajeLuz <= 20)
+        estadoActual = ALERTA_LUZ;
+      break;
 
-    int httpCode = http.GET();
+    case ALERTA_TEMP:
+      if (temperatura <= tempBaja)
+        estadoActual = NORMAL;
+      break;
 
-    if (httpCode > 0){
-      Serial.println("Envio correcto");
-    } else {
-      Serial.println("Error en el envio");
-    }
+    case ALERTA_LUZ:
+      if (porcentajeLuz > 30)
+        estadoActual = NORMAL;
+      break;
 
-    http.end();
+    case ALERTA_DOBLE:
+      if (temperatura <= tempBaja && porcentajeLuz > 30)
+        estadoActual = NORMAL;
+      break;
+  }
+}
 
-  } else {
-    Serial.println("WiFi desconectado....");
-    WiFi.reconnect();
+//---------------- ENVÍO MQTT ----------------//
+void enviarDatos() {
+
+  String payload = "{";
+  payload += "\"temperatura\": " + String(temperatura) + ",";
+  payload += "\"humedad\": " + String(humedad) + ",";
+  payload += "\"luz\": " + String(porcentajeLuz);
+  payload += "}";
+
+  client.publish("sensor/datos", payload.c_str());
+
+  Serial.println("Datos enviados MQTT:");
+  Serial.println(payload);
+}
+
+//---------------- LOOP PRINCIPAL ----------------//
+void loop() {
+
+  // 🔥 MANTENER MQTT SIEMPRE ACTIVO
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long ahora = millis();
+
+  // -------- TAREA 1: Sensores (2s) --------
+  if (ahora - tSensores >= 2000) {
+    tSensores = ahora;
+    leerSensores();
+    actualizarEstado();
   }
 
-  delay(20000); // mínimo 15s para ThingSpeak
+  // -------- TAREA 2: Envío (20s) --------
+  if (ahora - tEnvio >= 20000) {
+    tEnvio = ahora;
+    enviarDatos();
+  }
+
+  // -------- TAREA 3: LEDs (100ms) --------
+  if (ahora - tLED >= 100) {
+    tLED = ahora;
+
+    Serial.print("Estado: ");
+    Serial.println(estadoActual);
+  }
 }
