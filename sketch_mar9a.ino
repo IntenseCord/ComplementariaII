@@ -167,7 +167,7 @@ void enviarDatos() {
 //---------------- LOOP PRINCIPAL ----------------//
 void loop() {
 
-  // 🔥 MANTENER MQTT SIEMPRE ACTIVO
+  
   if (!client.connected()) {
     reconnect();
   }
